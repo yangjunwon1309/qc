@@ -19,6 +19,17 @@ class ACFQLAgent(flax.struct.PyTreeNode):
     network: Any
     config: Any = nonpytree_field()
 
+    def _actor_q(self, observations, actions, *, best_of_n=False):
+        """Return values with the actor's maximize convention in either mode."""
+        qs = self.network.select('critic')(observations, actions=actions)
+        if self.config.get('critic_mode', 'td') == 'graph':
+            # The critic estimates cost, so pessimistic value is the negative
+            # of the ensemble's maximum cost. Maximizing it minimizes cost.
+            return -jnp.max(jax.nn.softplus(qs), axis=0)
+        if not best_of_n or self.config['q_agg'] == 'mean':
+            return qs.mean(axis=0)
+        return qs.min(axis=0)
+
     def critic_loss(self, batch, grad_params, rng):
         """Compute the FQL critic loss."""
 
@@ -27,23 +38,41 @@ class ACFQLAgent(flax.struct.PyTreeNode):
         else:
             batch_actions = batch["actions"][..., 0, :] # take the first action
         
-        # TD loss
+        q = self.network.select('critic')(batch['observations'], actions=batch_actions, params=grad_params)
+
+        if self.config.get('critic_mode', 'td') == 'graph':
+            # Targets are stored per flattened QC row and correspond to the
+            # first row of the sampled action chunk.
+            # sample_sequence attaches these row-aligned annotations at the
+            # sampled chunk start, so they arrive as (batch,), unlike the
+            # temporal `valid` mask which has shape (batch, horizon).
+            target_cost = jnp.reshape(
+                batch['graph_target'], (batch['graph_target'].shape[0], -1)
+            )[:, 0]
+            graph_valid = jnp.reshape(
+                batch['graph_target_valid'], (batch['graph_target_valid'].shape[0], -1)
+            )[:, 0].astype(jnp.bool_)
+            valid = graph_valid & batch['valid'][..., -1].astype(jnp.bool_)
+            q = jax.nn.softplus(q)
+            critic_loss = (jnp.square(q - target_cost[None, :]) * valid[None, :]).mean()
+            return critic_loss, {
+                'critic_loss': critic_loss,
+                'cost_mean': q.mean(),
+                'cost_max': q.max(),
+                'cost_min': q.min(),
+            }
+
+        # Original TD loss, unchanged for the baseline.
         rng, sample_rng = jax.random.split(rng)
         next_actions = self.sample_actions(batch['next_observations'][..., -1, :], rng=sample_rng)
-
         next_qs = self.network.select(f'target_critic')(batch['next_observations'][..., -1, :], actions=next_actions)
         if self.config['q_agg'] == 'min':
             next_q = next_qs.min(axis=0)
         else:
             next_q = next_qs.mean(axis=0)
-        
         target_q = batch['rewards'][..., -1] + \
             (self.config['discount'] ** self.config["horizon_length"]) * batch['masks'][..., -1] * next_q
-
-        q = self.network.select('critic')(batch['observations'], actions=batch_actions, params=grad_params)
-        
         critic_loss = (jnp.square(q - target_q) * batch['valid'][..., -1]).mean()
-
         return critic_loss, {
             'critic_loss': critic_loss,
             'q_mean': q.mean(),
@@ -91,8 +120,7 @@ class ACFQLAgent(flax.struct.PyTreeNode):
             # Q loss.
             actor_actions = jnp.clip(actor_actions, -1, 1)
 
-            qs = self.network.select(f'critic')(batch['observations'], actions=actor_actions)
-            q = jnp.mean(qs, axis=0)
+            q = self._actor_q(batch['observations'], actor_actions)
             q_loss = -q.mean()
         else:
             distill_loss = jnp.zeros(())
@@ -144,7 +172,8 @@ class ACFQLAgent(flax.struct.PyTreeNode):
             return agent.total_loss(batch, grad_params, rng=rng)
 
         new_network, info = agent.network.apply_loss_fn(loss_fn=loss_fn)
-        agent.target_update(new_network, 'critic')
+        if agent.config.get('critic_mode', 'td') != 'graph':
+            agent.target_update(new_network, 'critic')
         return agent.replace(network=new_network, rng=new_rng), info
 
     @jax.jit
@@ -190,10 +219,7 @@ class ACFQLAgent(flax.struct.PyTreeNode):
             observations = jnp.repeat(observations[..., None, :], self.config["actor_num_samples"], axis=-2)
             actions = self.compute_flow_actions(observations, noises)
             actions = jnp.clip(actions, -1, 1)
-            if self.config["q_agg"] == "mean":
-                q = self.network.select("critic")(observations, actions).mean(axis=0)
-            else:
-                q = self.network.select("critic")(observations, actions).min(axis=0)
+            q = self._actor_q(observations, actions, best_of_n=True)
             indices = jnp.argmax(q, axis=-1)
 
             bshape = indices.shape
@@ -337,6 +363,8 @@ def get_config():
             action_chunking=True,  # False means n-step return
             actor_type="distill-ddpg",
             actor_num_samples=32,  # for actor_type="best-of-n" only
+            critic_mode='td',  # 'td' baseline or offline graph-cost regression.
+            graph_target_unit='steps',
             use_fourier_features=False,
             fourier_feature_dim=64,
             weight_decay=0.,

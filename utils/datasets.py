@@ -141,7 +141,7 @@ class Dataset(FrozenDict):
         actions = batch_actions  # (batch_size, sequence_length, action_dim)
         next_actions = batch_next_actions  # (batch_size, sequence_length, action_dim)
         
-        return dict(
+        result = dict(
             observations=data['observations'].copy(),
             full_observations=observations,
             actions=actions,
@@ -152,6 +152,10 @@ class Dataset(FrozenDict):
             next_observations=next_observations,
             next_actions=next_actions,
         )
+        for key in ('graph_target', 'graph_target_valid'):
+            if key in data:
+                result[key] = data[key].copy()
+        return result
 
     def get_subset(self, idxs):
         """Return a subset of the dataset given the indices."""

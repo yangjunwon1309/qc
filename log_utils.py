@@ -86,7 +86,9 @@ def setup_wandb(
             start_method='thread',
             _disable_stats=False,
         ),
-        mode=mode,
+        # Respect WANDB_MODE so benchmark runs can be explicitly kept local,
+        # even when the caller's default is online.
+        mode=os.environ.get('WANDB_MODE', mode),
     )
 
     run = wandb.init(**init_kwargs)

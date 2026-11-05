@@ -24,6 +24,8 @@ flags.DEFINE_string('run_group', 'Debug', 'Run group.')
 flags.DEFINE_integer('seed', 0, 'Random seed.')
 flags.DEFINE_string('env_name', 'cube-triple-play-singletask-task2-v0', 'Environment (dataset) name.')
 flags.DEFINE_string('save_dir', 'exp/', 'Save directory.')
+flags.DEFINE_string('graph_targets', None, 'GraphCritic targets.npz/JSON pair for offline graph-critic training.')
+flags.DEFINE_string('graph_dataset_id', None, 'Expected dataset ID recorded in the graph target metadata.')
 
 flags.DEFINE_integer('offline_steps', 1000000, 'Number of online steps.')
 flags.DEFINE_integer('online_steps', 1000000, 'Number of online steps.')
@@ -52,6 +54,22 @@ flags.DEFINE_bool('sparse', False, "make the task sparse reward")
 
 flags.DEFINE_bool('save_all_online_states', False, "save all trajectories to npy")
 
+
+def _qc_chunk_valid(terminals, horizon):
+    """Return QC's start-row validity for its `valid[..., -1]` chunk mask."""
+    terminals = np.asarray(terminals, dtype=np.bool_)
+    n_rows = terminals.size
+    valid = np.zeros(n_rows, dtype=np.bool_)
+    n_starts = max(0, n_rows - horizon + 1)
+    if n_starts == 0:
+        return valid
+    prefix = np.r_[0, np.cumsum(terminals, dtype=np.int64)]
+    starts = np.arange(n_starts)
+    # A terminal on the last row of the chunk is valid; only an earlier
+    # terminal invalidates the endpoint used by QC's critic loss.
+    valid[:n_starts] = (prefix[starts + horizon - 1] - prefix[starts]) == 0
+    return valid
+
 class LoggingHelper:
     def __init__(self, csv_loggers, wandb_logger):
         self.csv_loggers = csv_loggers
@@ -76,6 +94,14 @@ def main(_):
         json.dump(flag_dict, f)
 
     config = FLAGS.agent
+    critic_mode = config.get('critic_mode', 'td')
+    if critic_mode not in {'td', 'graph'}:
+        raise ValueError("--agent.critic_mode must be either 'td' or 'graph'")
+    if config.get('graph_target_unit', 'steps') != 'steps':
+        raise ValueError("QC graph-cost training currently supports --agent.graph_target_unit=steps only")
+    graph_mode = critic_mode == 'graph'
+    if graph_mode and FLAGS.ogbench_dataset_dir is not None:
+        raise ValueError('graph-target training does not support replaceable --ogbench_dataset_dir datasets')
     
     # data loading
     if FLAGS.ogbench_dataset_dir is not None:
@@ -93,6 +119,39 @@ def main(_):
         )
     else:
         env, eval_env, train_dataset, val_dataset = make_env_and_datasets(FLAGS.env_name)
+
+    if FLAGS.graph_targets is not None:
+        if not graph_mode:
+            raise ValueError('--graph_targets requires --agent.critic_mode=graph')
+        if FLAGS.online_steps > 0:
+            raise ValueError('graph-target training is offline-only; set --online_steps=0')
+        if FLAGS.graph_dataset_id is None:
+            raise ValueError('--graph_dataset_id is required with --graph_targets to check target provenance')
+        from graphcritic.io import load_targets
+
+        targets = load_targets(
+            FLAGS.graph_targets,
+            expected_dataset_id=FLAGS.graph_dataset_id,
+        )
+        if targets.unit != config.get('graph_target_unit', 'steps'):
+            raise ValueError('graph target unit does not match --agent.graph_target_unit')
+        if targets.h != FLAGS.horizon_length:
+            raise ValueError(
+                f'graph target horizon {targets.h} does not match --horizon_length={FLAGS.horizon_length}'
+            )
+        target_dataset_id = targets.dataset_id.split(':')
+        if len(target_dataset_id) < 3 or target_dataset_id[1] != FLAGS.env_name:
+            raise ValueError('graph target dataset_id does not match --env_name')
+        if targets.y.shape != (len(train_dataset['observations']),):
+            raise ValueError('graph targets must preserve the complete flattened QC train-row count')
+        expected_valid = _qc_chunk_valid(train_dataset['terminals'], FLAGS.horizon_length)
+        if not np.array_equal(targets.valid, expected_valid):
+            raise ValueError('graph target validity does not match QC sample_sequence boundaries')
+        train_dataset = dict(train_dataset)
+        train_dataset['graph_target'] = targets.y
+        train_dataset['graph_target_valid'] = targets.valid
+    elif graph_mode:
+        raise ValueError('--agent.critic_mode=graph requires --graph_targets')
 
     # house keeping
     random.seed(FLAGS.seed)
@@ -326,8 +385,11 @@ def main(_):
             c_data["button_states"] = np.stack(data["button_states"], axis=0)
         np.savez(os.path.join(FLAGS.save_dir, "data.npz"), **c_data)
 
-    with open(os.path.join(FLAGS.save_dir, 'token.tk'), 'w') as f:
-        f.write(run.url)
+    # Offline W&B runs have no URL. Keep the run artifacts local without
+    # turning an otherwise completed training job into a shutdown error.
+    if run.url is not None:
+        with open(os.path.join(FLAGS.save_dir, 'token.tk'), 'w') as f:
+            f.write(run.url)
 
 if __name__ == '__main__':
     app.run(main)
