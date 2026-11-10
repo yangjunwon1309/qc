@@ -1,4 +1,5 @@
 import glob, tqdm, wandb, os, json, random, time, jax
+from pathlib import Path
 from absl import app, flags
 from ml_collections import config_flags
 from log_utils import setup_wandb, get_exp_name, get_flag_dict, CsvLogger
@@ -26,6 +27,7 @@ flags.DEFINE_string('env_name', 'cube-triple-play-singletask-task2-v0', 'Environ
 flags.DEFINE_string('save_dir', 'exp/', 'Save directory.')
 flags.DEFINE_string('graph_targets', None, 'GraphCritic targets.npz/JSON pair for offline graph-critic training.')
 flags.DEFINE_string('graph_dataset_id', None, 'Expected dataset ID recorded in the graph target metadata.')
+flags.DEFINE_string('graph_target_provenance', None, 'Resolved provenance of graph targets; populated from target JSON.')
 
 flags.DEFINE_integer('offline_steps', 1000000, 'Number of online steps.')
 flags.DEFINE_integer('online_steps', 1000000, 'Number of online steps.')
@@ -48,6 +50,7 @@ config_flags.DEFINE_config_file('agent', 'agents/acfql.py', lock_config=False)
 flags.DEFINE_float('dataset_proportion', 1.0, "Proportion of the dataset to use")
 flags.DEFINE_integer('dataset_replace_interval', 1000, 'Dataset replace interval, used for large datasets because of memory constraints')
 flags.DEFINE_string('ogbench_dataset_dir', None, 'OGBench dataset directory')
+flags.DEFINE_string('ogbench_dataset_path', None, 'Fixed OGBench training NPZ; requires adjacent -val.npz')
 
 flags.DEFINE_integer('horizon_length', 5, 'action chunking length.')
 flags.DEFINE_bool('sparse', False, "make the task sparse reward")
@@ -70,6 +73,45 @@ def _qc_chunk_valid(terminals, horizon):
     valid[:n_starts] = (prefix[starts + horizon - 1] - prefix[starts]) == 0
     return valid
 
+
+def _load_graph_target_provenance(target_path):
+    """Read target provenance; legacy target files are treated as learned."""
+    if target_path is None:
+        return {'kind': 'learned'}
+    metadata_path = Path(target_path).with_suffix('.json')
+    try:
+        metadata = json.loads(metadata_path.read_text())
+    except FileNotFoundError:
+        # load_targets will report a missing JSON artifact after environment setup.
+        return {'kind': 'learned'}
+    provenance = metadata.get('target_provenance')
+    if provenance is None:
+        return {'kind': 'learned'}
+    if not isinstance(provenance, dict):
+        raise ValueError('target_provenance must be a JSON object')
+    kind = provenance.get('kind')
+    if kind == 'learned':
+        return {'kind': 'learned'}
+    if kind == 'oracle_upper_bound':
+        oracle_np_max = provenance.get('oracle_np_max')
+        if isinstance(oracle_np_max, bool) or not isinstance(oracle_np_max, int) or oracle_np_max < 0:
+            raise ValueError('oracle_upper_bound provenance requires a non-negative integer oracle_np_max')
+        return {'kind': kind, 'oracle_np_max': oracle_np_max}
+    raise ValueError(f'unsupported graph target provenance kind: {kind!r}')
+
+
+def _validate_oracle_run_group(provenance, run_group):
+    if provenance.get('kind') == 'oracle_upper_bound' and 'oracle' not in str(run_group).lower():
+        raise ValueError(
+            'oracle_upper_bound targets require --run_group to contain the word "oracle"'
+        )
+
+
+def _provenance_csv_value(provenance):
+    if provenance.get('kind') == 'oracle_upper_bound':
+        return f"oracle_upper_bound|oracle_np_max={provenance['oracle_np_max']}"
+    return 'learned'
+
 class LoggingHelper:
     def __init__(self, csv_loggers, wandb_logger):
         self.csv_loggers = csv_loggers
@@ -83,6 +125,11 @@ class LoggingHelper:
         self.wandb_logger.log({f'{prefix}/{k}': v for k, v in data.items()}, step=step)
 
 def main(_):
+    target_provenance = _load_graph_target_provenance(FLAGS.graph_targets)
+    _validate_oracle_run_group(target_provenance, FLAGS.run_group)
+    FLAGS.graph_target_provenance = json.dumps(target_provenance, sort_keys=True)
+    provenance_csv = _provenance_csv_value(target_provenance)
+    print(f'Graph target provenance: {json.dumps(target_provenance, sort_keys=True)}', flush=True)
     exp_name = get_exp_name(FLAGS.seed)
     run = setup_wandb(project='qc', group=FLAGS.run_group, name=exp_name)
     
@@ -98,13 +145,24 @@ def main(_):
     if critic_mode not in {'td', 'graph'}:
         raise ValueError("--agent.critic_mode must be either 'td' or 'graph'")
     if config.get('graph_target_unit', 'steps') != 'steps':
-        raise ValueError("QC graph-cost training currently supports --agent.graph_target_unit=steps only")
+        raise ValueError("QC graph-target training currently supports --agent.graph_target_unit=steps only")
+    graph_target_kind = config.get('graph_target_kind', 'regret')
+    if graph_target_kind not in {'cost', 'regret'}:
+        raise ValueError("--agent.graph_target_kind must be either 'cost' or 'regret'")
     graph_mode = critic_mode == 'graph'
+    if FLAGS.ogbench_dataset_dir is not None and FLAGS.ogbench_dataset_path is not None:
+        raise ValueError('choose either --ogbench_dataset_dir or --ogbench_dataset_path')
     if graph_mode and FLAGS.ogbench_dataset_dir is not None:
         raise ValueError('graph-target training does not support replaceable --ogbench_dataset_dir datasets')
     
     # data loading
-    if FLAGS.ogbench_dataset_dir is not None:
+    if FLAGS.ogbench_dataset_path is not None:
+        env, eval_env, train_dataset, val_dataset = make_ogbench_env_and_datasets(
+            FLAGS.env_name,
+            dataset_path=os.path.expanduser(FLAGS.ogbench_dataset_path),
+            compact_dataset=False,
+        )
+    elif FLAGS.ogbench_dataset_dir is not None:
         # custom ogbench dataset
         assert FLAGS.dataset_replace_interval != 0
         assert FLAGS.dataset_proportion == 1.0
@@ -132,9 +190,17 @@ def main(_):
         targets = load_targets(
             FLAGS.graph_targets,
             expected_dataset_id=FLAGS.graph_dataset_id,
+            require_loss_mask=True,
         )
         if targets.unit != config.get('graph_target_unit', 'steps'):
             raise ValueError('graph target unit does not match --agent.graph_target_unit')
+        if targets.kind != graph_target_kind:
+            raise ValueError(
+                f'graph target kind {targets.kind!r} does not match '
+                f'--agent.graph_target_kind={graph_target_kind!r}'
+            )
+        if targets.loss_mask is None:
+            raise ValueError('graph target artifact is missing graph_target_loss_mask')
         if targets.h != FLAGS.horizon_length:
             raise ValueError(
                 f'graph target horizon {targets.h} does not match --horizon_length={FLAGS.horizon_length}'
@@ -150,6 +216,7 @@ def main(_):
         train_dataset = dict(train_dataset)
         train_dataset['graph_target'] = targets.y
         train_dataset['graph_target_valid'] = targets.valid
+        train_dataset['graph_target_loss_mask'] = targets.loss_mask
     elif graph_mode:
         raise ValueError('--agent.critic_mode=graph requires --graph_targets')
 
@@ -240,6 +307,7 @@ def main(_):
         agent, offline_info = agent.update(batch)
 
         if i % FLAGS.log_interval == 0:
+            offline_info['graph_target_provenance'] = provenance_csv
             logger.log(offline_info, "offline_agent", step=log_step)
         
         # saving
@@ -247,8 +315,16 @@ def main(_):
             save_agent(agent, FLAGS.save_dir, log_step)
 
         # eval
-        if i == FLAGS.offline_steps - 1 or \
-            (FLAGS.eval_interval != 0 and i % FLAGS.eval_interval == 0):
+        should_eval = (
+            FLAGS.eval_interval != 0 and i % FLAGS.eval_interval == 0
+        ) or (
+            i == FLAGS.offline_steps
+            and (
+                FLAGS.eval_interval == 0
+                or FLAGS.offline_steps % FLAGS.eval_interval != 0
+            )
+        )
+        if should_eval:
             # during eval, the action chunk is executed fully
             eval_info, _, _ = evaluate(
                 agent=agent,
@@ -258,6 +334,7 @@ def main(_):
                 num_video_episodes=FLAGS.video_episodes,
                 video_frame_skip=FLAGS.video_frame_skip,
             )
+            eval_info['graph_target_provenance'] = provenance_csv
             logger.log(eval_info, "eval", step=log_step)
 
     # transition from offline to online
@@ -362,6 +439,7 @@ def main(_):
                 num_video_episodes=FLAGS.video_episodes,
                 video_frame_skip=FLAGS.video_frame_skip,
             )
+            eval_info['graph_target_provenance'] = provenance_csv
             logger.log(eval_info, "eval", step=log_step)
 
         # saving

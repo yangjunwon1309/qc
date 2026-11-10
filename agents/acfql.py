@@ -11,6 +11,33 @@ from utils.encoders import encoder_modules
 from utils.flax_utils import ModuleDict, TrainState, nonpytree_field
 from utils.networks import ActorVectorField, Value
 
+
+def _masked_spearman(prediction, target, mask):
+    """JAX-compatible Spearman correlation with average ranks for ties."""
+    prediction = jnp.ravel(prediction)
+    target = jnp.ravel(target)
+    mask = jnp.ravel(mask).astype(jnp.bool_)
+
+    def ranks(values):
+        left = values[:, None]
+        right = values[None, :]
+        valid_right = mask[None, :]
+        less = jnp.sum(valid_right & (right < left), axis=1)
+        ties = jnp.sum(valid_right & (right == left), axis=1)
+        return less.astype(jnp.float32) + 0.5 * (ties.astype(jnp.float32) - 1.0)
+
+    pred_rank = ranks(prediction)
+    target_rank = ranks(target)
+    count = jnp.maximum(jnp.sum(mask), 1).astype(jnp.float32)
+    pred_mean = jnp.sum(jnp.where(mask, pred_rank, 0.0)) / count
+    target_mean = jnp.sum(jnp.where(mask, target_rank, 0.0)) / count
+    pred_centered = jnp.where(mask, pred_rank - pred_mean, 0.0)
+    target_centered = jnp.where(mask, target_rank - target_mean, 0.0)
+    covariance = jnp.sum(pred_centered * target_centered)
+    scale = jnp.sqrt(jnp.sum(pred_centered ** 2) * jnp.sum(target_centered ** 2))
+    corr = covariance / jnp.maximum(scale, 1e-8)
+    return jnp.where((jnp.sum(mask) >= 2) & (scale > 1e-8), corr, 0.0)
+
 class ACFQLAgent(flax.struct.PyTreeNode):
     """Flow Q-learning (FQL) agent with action chunking. 
     """
@@ -23,8 +50,8 @@ class ACFQLAgent(flax.struct.PyTreeNode):
         """Return values with the actor's maximize convention in either mode."""
         qs = self.network.select('critic')(observations, actions=actions)
         if self.config.get('critic_mode', 'td') == 'graph':
-            # The critic estimates cost, so pessimistic value is the negative
-            # of the ensemble's maximum cost. Maximizing it minimizes cost.
+            # The critic estimates a non-negative graph target. Maximizing the
+            # negative ensemble maximum chooses the smallest cost or regret.
             return -jnp.max(jax.nn.softplus(qs), axis=0)
         if not best_of_n or self.config['q_agg'] == 'mean':
             return qs.mean(axis=0)
@@ -41,7 +68,7 @@ class ACFQLAgent(flax.struct.PyTreeNode):
         q = self.network.select('critic')(batch['observations'], actions=batch_actions, params=grad_params)
 
         if self.config.get('critic_mode', 'td') == 'graph':
-            # Targets are stored per flattened QC row and correspond to the
+            # Cost/regret targets are stored per flattened QC row and correspond to the
             # first row of the sampled action chunk.
             # sample_sequence attaches these row-aligned annotations at the
             # sampled chunk start, so they arrive as (batch,), unlike the
@@ -52,15 +79,40 @@ class ACFQLAgent(flax.struct.PyTreeNode):
             graph_valid = jnp.reshape(
                 batch['graph_target_valid'], (batch['graph_target_valid'].shape[0], -1)
             )[:, 0].astype(jnp.bool_)
-            valid = graph_valid & batch['valid'][..., -1].astype(jnp.bool_)
+            if 'graph_target_loss_mask' not in batch:
+                raise ValueError('graph critic batch is missing graph_target_loss_mask')
+            loss_mask = jnp.reshape(
+                batch['graph_target_loss_mask'],
+                (batch['graph_target_loss_mask'].shape[0], -1),
+            )[:, 0].astype(jnp.bool_)
+            valid = graph_valid & loss_mask & batch['valid'][..., -1].astype(jnp.bool_)
             q = jax.nn.softplus(q)
-            critic_loss = (jnp.square(q - target_cost[None, :]) * valid[None, :]).mean()
-            return critic_loss, {
+            mask = valid[None, :].astype(q.dtype)
+            denom = jnp.maximum(jnp.sum(mask) * q.shape[0], 1.0)
+            critic_loss = jnp.sum(jnp.square(q - target_cost[None, :]) * mask) / denom
+            ensemble_mean = jnp.mean(q, axis=0)
+            pred_mean = jnp.sum(ensemble_mean * valid) / jnp.maximum(jnp.sum(valid), 1)
+            target_mean = jnp.sum(target_cost * valid) / jnp.maximum(jnp.sum(valid), 1)
+            kind = self.config.get('graph_target_kind', 'regret')
+            metrics = {
                 'critic_loss': critic_loss,
-                'cost_mean': q.mean(),
-                'cost_max': q.max(),
-                'cost_min': q.min(),
+                'graph_target_valid_frac': jnp.mean(valid.astype(jnp.float32)),
+                'graph_target_spearman': _masked_spearman(ensemble_mean, target_cost, valid),
             }
+            if kind == 'regret':
+                metrics.update({
+                    'regret_pred_mean': pred_mean,
+                    'regret_target_mean': target_mean,
+                    'regret_batch_spearman': metrics['graph_target_spearman'],
+                })
+            else:
+                metrics.update({
+                    'cost_mean': pred_mean,
+                    'cost_target_mean': target_mean,
+                    'cost_max': q.max(),
+                    'cost_min': q.min(),
+                })
+            return critic_loss, metrics
 
         # Original TD loss, unchanged for the baseline.
         rng, sample_rng = jax.random.split(rng)
@@ -121,6 +173,8 @@ class ACFQLAgent(flax.struct.PyTreeNode):
             actor_actions = jnp.clip(actor_actions, -1, 1)
 
             q = self._actor_q(batch['observations'], actor_actions)
+            # In graph mode _actor_q is -max_ensemble softplus(Q), so this is
+            # mean(max_ensemble softplus(Q)) as specified for FQL regret.
             q_loss = -q.mean()
         else:
             distill_loss = jnp.zeros(())
@@ -365,6 +419,7 @@ def get_config():
             actor_num_samples=32,  # for actor_type="best-of-n" only
             critic_mode='td',  # 'td' baseline or offline graph-cost regression.
             graph_target_unit='steps',
+            graph_target_kind='regret',
             use_fourier_features=False,
             fourier_feature_dim=64,
             weight_decay=0.,

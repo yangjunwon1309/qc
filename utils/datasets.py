@@ -152,7 +152,7 @@ class Dataset(FrozenDict):
             next_observations=next_observations,
             next_actions=next_actions,
         )
-        for key in ('graph_target', 'graph_target_valid'):
+        for key in ('graph_target', 'graph_target_valid', 'graph_target_loss_mask'):
             if key in data:
                 result[key] = data[key].copy()
         return result
