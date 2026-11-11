@@ -28,6 +28,8 @@ flags.DEFINE_string('save_dir', 'exp/', 'Save directory.')
 flags.DEFINE_string('graph_targets', None, 'GraphCritic targets.npz/JSON pair for offline graph-critic training.')
 flags.DEFINE_string('graph_dataset_id', None, 'Expected dataset ID recorded in the graph target metadata.')
 flags.DEFINE_string('graph_target_provenance', None, 'Resolved provenance of graph targets; populated from target JSON.')
+flags.DEFINE_string('direct_q_config', None, 'direct graph-Q scorer JSON configuration.')
+flags.DEFINE_bool('eval_bc_also', False, 'Evaluate the same actor checkpoint with one unscored BC proposal.')
 
 flags.DEFINE_integer('offline_steps', 1000000, 'Number of online steps.')
 flags.DEFINE_integer('online_steps', 1000000, 'Number of online steps.')
@@ -112,6 +114,67 @@ def _provenance_csv_value(provenance):
         return f"oracle_upper_bound|oracle_np_max={provenance['oracle_np_max']}"
     return 'learned'
 
+
+def _load_direct_q_provenance(config_path):
+    if config_path is None:
+        return None
+    config = json.loads(Path(config_path).read_text())
+    graph_path = Path(config['graph'])
+    graph_meta = json.loads(graph_path.with_suffix('.json').read_text())
+    meta = graph_meta.get('meta', {})
+    provenance = meta.get('target_provenance', {})
+    if graph_meta.get('content_hash') != config.get('graph_hash'):
+        raise ValueError('direct-Q config graph hash does not match graph metadata')
+    if config.get('spec_version') == 'v1.0':
+        if config.get('anchor_mode') != 'dplus' or provenance.get('kind') != 'learned':
+            raise ValueError('v1.0 graph_direct requires a learned L+ graph and dplus anchors')
+        model_meta = meta.get('bridge_model_metadata', {})
+        if model_meta.get('params_sha256') != config.get('state_checkpoint_sha256'):
+            raise ValueError('L+ graph was not built from the configured dplus checkpoint')
+        return {'kind': 'learned', 'graph_hash': config['graph_hash'], 'spec_version': 'v1.0'}
+    if provenance.get('kind') != 'oracle_upper_bound' or provenance.get('oracle_np_max') != 1:
+        raise ValueError('v0.9 graph_direct requires the O_np1 oracle_upper_bound graph')
+    if meta.get('qc_eligible') != 'oracle_upper_bound':
+        raise ValueError('direct-Q graph is not marked QC eligible as an oracle upper bound')
+    expected_hash = 'bb5b26bf1776785d7196745d97ee1b98e177feeb7112c69ef6344c9c3b3548f9'
+    if config.get('graph_hash') != expected_hash:
+        raise ValueError('v0.9 graph_direct is pinned to the v0.8.4b O_np1 graph hash')
+    return {'kind': 'oracle_upper_bound', 'oracle_np_max': 1, 'graph_hash': config['graph_hash']}
+
+
+def _direct_action_selector(scorer, *, n_samples, action_dim, horizon, seed):
+    import jax
+    import jax.numpy as jnp
+    from graphcritic.direct_q import puzzle_observation_window
+
+    key = jax.random.PRNGKey(seed)
+    action_size = action_dim * horizon
+
+    def select(agent, observation, observation_history, physical_history):
+        nonlocal key
+        key, sample_key = jax.random.split(key)
+        observations = jnp.broadcast_to(
+            jnp.asarray(observation, dtype=jnp.float32), (n_samples, *np.asarray(observation).shape)
+        )
+        noises = jax.random.normal(sample_key, (n_samples, action_size))
+        chunks = np.asarray(jax.device_get(agent.compute_flow_actions(observations, noises)))
+        qpos_history = np.stack([item[0] for item in physical_history])
+        button_history = np.stack([item[1] for item in physical_history])
+        window, board = puzzle_observation_window(
+            observation_history, scorer.state_mean, scorer.state_std,
+            qpos_history=qpos_history, button_history=button_history,
+            n_buttons=scorer.n_buttons, window=scorer.horizon,
+        )
+        if n_samples == 1:
+            return chunks[0], None
+        values, diagnostic = scorer.score(
+            window, chunks.reshape(n_samples, horizon, action_dim), board=board,
+        )
+        selected = int(diagnostic['selected_index'])
+        return chunks[selected], diagnostic
+
+    return select
+
 class LoggingHelper:
     def __init__(self, csv_loggers, wandb_logger):
         self.csv_loggers = csv_loggers
@@ -126,6 +189,14 @@ class LoggingHelper:
 
 def main(_):
     target_provenance = _load_graph_target_provenance(FLAGS.graph_targets)
+    direct_provenance = _load_direct_q_provenance(FLAGS.direct_q_config)
+    if direct_provenance is not None:
+        if (direct_provenance.get('kind') == 'oracle_upper_bound'
+                and 'oracle' not in str(FLAGS.run_group).lower()):
+            raise ValueError('oracle_upper_bound direct-Q runs require "oracle" in --run_group')
+        if FLAGS.graph_targets is not None:
+            raise ValueError('graph_direct consumes the graph config directly and must not use --graph_targets')
+        target_provenance = direct_provenance
     _validate_oracle_run_group(target_provenance, FLAGS.run_group)
     FLAGS.graph_target_provenance = json.dumps(target_provenance, sort_keys=True)
     provenance_csv = _provenance_csv_value(target_provenance)
@@ -142,14 +213,34 @@ def main(_):
 
     config = FLAGS.agent
     critic_mode = config.get('critic_mode', 'td')
-    if critic_mode not in {'td', 'graph'}:
-        raise ValueError("--agent.critic_mode must be either 'td' or 'graph'")
+    if critic_mode not in {'td', 'graph', 'graph_direct'}:
+        raise ValueError("--agent.critic_mode must be 'td', 'graph', or 'graph_direct'")
     if config.get('graph_target_unit', 'steps') != 'steps':
         raise ValueError("QC graph-target training currently supports --agent.graph_target_unit=steps only")
     graph_target_kind = config.get('graph_target_kind', 'regret')
-    if graph_target_kind not in {'cost', 'regret'}:
-        raise ValueError("--agent.graph_target_kind must be either 'cost' or 'regret'")
+    if graph_target_kind not in {'cost', 'regret', 'discounted'}:
+        raise ValueError("--agent.graph_target_kind must be 'cost', 'regret', or 'discounted'")
     graph_mode = critic_mode == 'graph'
+    direct_q_mode = critic_mode == 'graph_direct'
+    if direct_q_mode:
+        if FLAGS.direct_q_config is None or direct_provenance is None:
+            raise ValueError('--agent.critic_mode=graph_direct requires --direct_q_config')
+        if config.get('actor_type') != 'best-of-n' or not config.get('action_chunking'):
+            raise ValueError('graph_direct requires best-of-n and action chunking')
+        if FLAGS.horizon_length != 5 or FLAGS.online_steps != 0:
+            raise ValueError('graph_direct supports five-step chunks and offline-only training')
+        if FLAGS.offline_steps != 300000 or config.get('actor_num_samples') != 32:
+            raise ValueError('direct-Q runs are fixed to 300k updates and 32 policy proposals')
+        if FLAGS.dataset_proportion != 1.0 or FLAGS.ogbench_dataset_dir is not None or FLAGS.ogbench_dataset_path is not None:
+            raise ValueError('graph_direct is pinned to the standard OGBench dataset')
+        if FLAGS.eval_bc_also:
+            eval_bc_prefix = True
+        else:
+            eval_bc_prefix = False
+    else:
+        if FLAGS.direct_q_config is not None or FLAGS.eval_bc_also:
+            raise ValueError('--direct_q_config and --eval_bc_also require graph_direct mode')
+        eval_bc_prefix = False
     if FLAGS.ogbench_dataset_dir is not None and FLAGS.ogbench_dataset_path is not None:
         raise ValueError('choose either --ogbench_dataset_dir or --ogbench_dataset_path')
     if graph_mode and FLAGS.ogbench_dataset_dir is not None:
@@ -178,6 +269,14 @@ def main(_):
     else:
         env, eval_env, train_dataset, val_dataset = make_env_and_datasets(FLAGS.env_name)
 
+    direct_scorer = None
+    if direct_q_mode:
+        direct_cfg = json.loads(Path(FLAGS.direct_q_config).read_text())
+        if FLAGS.env_name not in direct_cfg.get('dataset_id', ''):
+            raise ValueError('direct-Q dataset ID does not match --env_name')
+        from graphcritic.direct_q import load_direct_q_scorer
+        direct_scorer = load_direct_q_scorer(FLAGS.direct_q_config)
+
     if FLAGS.graph_targets is not None:
         if not graph_mode:
             raise ValueError('--graph_targets requires --agent.critic_mode=graph')
@@ -199,6 +298,10 @@ def main(_):
                 f'graph target kind {targets.kind!r} does not match '
                 f'--agent.graph_target_kind={graph_target_kind!r}'
             )
+        if targets.kind == 'discounted' and not np.isclose(
+            float(targets.discount_gamma), float(config.get('graph_target_gamma', 0.99))
+        ):
+            raise ValueError('discounted target gamma does not match --agent.graph_target_gamma')
         if targets.loss_mask is None:
             raise ValueError('graph target artifact is missing graph_target_loss_mask')
         if targets.h != FLAGS.horizon_length:
@@ -274,6 +377,8 @@ def main(_):
 
     # Setup logging.
     prefixes = ["eval", "env"]
+    if eval_bc_prefix:
+        prefixes.append('eval_bc')
     if FLAGS.offline_steps > 0:
         prefixes.append("offline_agent")
     if FLAGS.online_steps > 0:
@@ -326,7 +431,7 @@ def main(_):
         )
         if should_eval:
             # during eval, the action chunk is executed fully
-            eval_info, _, _ = evaluate(
+            eval_kwargs = dict(
                 agent=agent,
                 env=eval_env,
                 action_dim=example_batch["actions"].shape[-1],
@@ -334,8 +439,28 @@ def main(_):
                 num_video_episodes=FLAGS.video_episodes,
                 video_frame_skip=FLAGS.video_frame_skip,
             )
+            if direct_q_mode:
+                action_dim = example_batch["actions"].shape[-1]
+                eval_kwargs['action_selector'] = _direct_action_selector(
+                    direct_scorer, n_samples=config['actor_num_samples'],
+                    action_dim=action_dim, horizon=FLAGS.horizon_length, seed=FLAGS.seed + i,
+                )
+            eval_info, _, _ = evaluate(**eval_kwargs)
             eval_info['graph_target_provenance'] = provenance_csv
             logger.log(eval_info, "eval", step=log_step)
+            if direct_q_mode and eval_bc_prefix:
+                bc_info, _, _ = evaluate(
+                    **{
+                        **eval_kwargs,
+                        'action_selector': _direct_action_selector(
+                            direct_scorer, n_samples=1,
+                            action_dim=action_dim, horizon=FLAGS.horizon_length,
+                            seed=FLAGS.seed + i + 0xBC,
+                        ),
+                    }
+                )
+                bc_info['graph_target_provenance'] = provenance_csv
+                logger.log(bc_info, 'eval_bc', step=log_step)
 
     # transition from offline to online
     replay_buffer = ReplayBuffer.create_from_initial_dataset(

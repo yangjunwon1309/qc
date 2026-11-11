@@ -6,6 +6,25 @@ from tqdm import trange
 from functools import partial
 
 
+def _live_puzzle_readout(env):
+    """Read qpos and exact board bits from the live MuJoCo environment."""
+    state = {}
+    getter = getattr(env, 'get_state', None)
+    if callable(getter):
+        value = getter()
+        if isinstance(value, dict):
+            state.update(value)
+    unwrapped = getattr(env, 'unwrapped', env)
+    data = getattr(unwrapped, 'data', None)
+    if 'qpos' not in state and data is not None:
+        state['qpos'] = np.asarray(data.qpos).copy()
+    if 'button_states' not in state and hasattr(unwrapped, '_cur_button_states'):
+        state['button_states'] = np.asarray(unwrapped._cur_button_states).copy()
+    if 'qpos' not in state or 'button_states' not in state:
+        raise ValueError('direct-Q evaluation requires live qpos and button_states')
+    return np.asarray(state['qpos']).copy(), np.asarray(state['button_states']).copy()
+
+
 def supply_rng(f, rng=jax.random.PRNGKey(0)):
     """Helper function to split the random number generator key before each call to the function."""
 
@@ -45,6 +64,7 @@ def evaluate(
     action_shape=None,
     observation_shape=None,
     action_dim=None,
+    action_selector=None,
 ):
     """Evaluate the agent in the environment.
 
@@ -63,6 +83,7 @@ def evaluate(
     actor_fn = supply_rng(agent.sample_actions, rng=jax.random.PRNGKey(np.random.randint(0, 2**32)))
     trajs = []
     stats = defaultdict(list)
+    selector_diagnostics = []
 
     renders = []
     for i in trange(num_eval_episodes + num_video_episodes):
@@ -72,6 +93,10 @@ def evaluate(
         observation, info = env.reset()
             
         observation_history = []
+        observation_history.append(np.asarray(observation).copy())
+        physical_history = []
+        if action_selector is not None:
+            physical_history.append(_live_puzzle_readout(env))
         action_history = []
         
         done = False
@@ -85,10 +110,15 @@ def evaluate(
         gripper_contact_length = 0
         while not done:
             
-            action = actor_fn(observations=observation)
+            if action_selector is None:
+                action = actor_fn(observations=observation)
 
             if len(action_queue) == 0:
                 have_new_action = True
+                if action_selector is not None:
+                    action, selection_info = action_selector(agent, observation, observation_history, physical_history)
+                    if selection_info is not None:
+                        selector_diagnostics.append(selection_info)
                 action = np.array(action).reshape(-1, action_dim)
                 action_chunk_len = action.shape[0]
                 for a in action:
@@ -119,6 +149,9 @@ def evaluate(
             add_to(traj, transition)
             
             observation = next_observation
+            observation_history.append(np.asarray(observation).copy())
+            if action_selector is not None:
+                physical_history.append(_live_puzzle_readout(env))
             # print(info)
             if "proprio" in info and "gripper_contact" in info["proprio"]:
                 # print(info["gripper_contact"])
@@ -156,6 +189,25 @@ def evaluate(
 
     for k, v in stats.items():
         stats[k] = np.mean(v)
+
+    if selector_diagnostics:
+        stats['direct_q/fallback_fraction'] = float(np.mean([d.get('fallback', False) for d in selector_diagnostics]))
+        stats['direct_q/mean_neighborhood_size'] = float(np.mean([d.get('neighborhood_size', 0) for d in selector_diagnostics]))
+        selected_q = [d['selected_q'] for d in selector_diagnostics if d.get('selected_q') is not None and np.isfinite(d['selected_q'])]
+        q_std = [d['candidate_q_std'] for d in selector_diagnostics if d.get('candidate_q_std') is not None and np.isfinite(d['candidate_q_std'])]
+        stats['direct_q/selected_q_mean'] = float(np.mean(selected_q)) if selected_q else np.nan
+        stats['direct_q/candidate_q_std_mean'] = float(np.mean(q_std)) if q_std else np.nan
+        stats['direct_q/decision_seconds_mean'] = float(np.mean([d.get('decision_seconds', 0.0) for d in selector_diagnostics]))
+        reasons = {}
+        for diagnostic in selector_diagnostics:
+            if diagnostic.get('fallback'):
+                key = str(diagnostic.get('fallback_reason') or 'unknown')
+                reasons[key] = reasons.get(key, 0) + 1
+        stats['direct_q/fallback_count'] = int(sum(reasons.values()))
+        for key in ('no_board_nodes', 'no_finite_cost_nodes', 'no_route_within_K', 'unknown'):
+            stats[f'direct_q/fallback_{key}'] = int(reasons.get(key, 0))
+    if 'episode.final_reward' in stats:
+        stats['episode.final_wrong_buttons'] = -float(stats['episode.final_reward'])
 
     return stats, trajs, renders
 

@@ -49,6 +49,11 @@ class ACFQLAgent(flax.struct.PyTreeNode):
     def _actor_q(self, observations, actions, *, best_of_n=False):
         """Return values with the actor's maximize convention in either mode."""
         qs = self.network.select('critic')(observations, actions=actions)
+        if self.config.get('critic_mode', 'td') == 'graph_direct':
+            # The external direct-Q scorer selects actions outside the JAX
+            # training agent. This value is used only to preserve the sampler
+            # API when a caller asks for a single policy proposal.
+            return jnp.zeros(qs.shape[1:], dtype=qs.dtype)
         if self.config.get('critic_mode', 'td') == 'graph':
             # The critic estimates a non-negative graph target. Maximizing the
             # negative ensemble maximum chooses the smallest cost or regret.
@@ -59,6 +64,9 @@ class ACFQLAgent(flax.struct.PyTreeNode):
 
     def critic_loss(self, batch, grad_params, rng):
         """Compute the FQL critic loss."""
+
+        if self.config.get('critic_mode', 'td') == 'graph_direct':
+            return jnp.zeros((), dtype=jnp.float32), {'critic_loss': jnp.zeros((), dtype=jnp.float32)}
 
         if self.config["action_chunking"]:
             batch_actions = jnp.reshape(batch["actions"], (batch["actions"].shape[0], -1))
@@ -106,11 +114,12 @@ class ACFQLAgent(flax.struct.PyTreeNode):
                     'regret_batch_spearman': metrics['graph_target_spearman'],
                 })
             else:
+                prefix = 'discounted' if kind == 'discounted' else 'cost'
                 metrics.update({
-                    'cost_mean': pred_mean,
-                    'cost_target_mean': target_mean,
-                    'cost_max': q.max(),
-                    'cost_min': q.min(),
+                    f'{prefix}_mean': pred_mean,
+                    f'{prefix}_target_mean': target_mean,
+                    f'{prefix}_max': q.max(),
+                    f'{prefix}_min': q.min(),
                 })
             return critic_loss, metrics
 
@@ -226,8 +235,17 @@ class ACFQLAgent(flax.struct.PyTreeNode):
             return agent.total_loss(batch, grad_params, rng=rng)
 
         new_network, info = agent.network.apply_loss_fn(loss_fn=loss_fn)
-        if agent.config.get('critic_mode', 'td') != 'graph':
+        mode = agent.config.get('critic_mode', 'td')
+        if mode not in {'graph', 'graph_direct'}:
             agent.target_update(new_network, 'critic')
+        elif mode == 'graph_direct':
+            # Keep the unused critic and target critic bit-identical even when
+            # a caller supplies AdamW/weight decay in the shared optimizer.
+            params = flax.core.unfreeze(new_network.params)
+            old_params = agent.network.params
+            params['modules_critic'] = old_params['modules_critic']
+            params['modules_target_critic'] = old_params['modules_target_critic']
+            new_network = new_network.replace(params=flax.core.freeze(params))
         return agent.replace(network=new_network, rng=new_rng), info
 
     @jax.jit
@@ -420,6 +438,7 @@ def get_config():
             critic_mode='td',  # 'td' baseline or offline graph-cost regression.
             graph_target_unit='steps',
             graph_target_kind='regret',
+            graph_target_gamma=0.99,
             use_fourier_features=False,
             fourier_feature_dim=64,
             weight_decay=0.,
