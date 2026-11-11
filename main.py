@@ -132,15 +132,16 @@ def _load_direct_q_provenance(config_path):
         if model_meta.get('params_sha256') != config.get('state_checkpoint_sha256'):
             raise ValueError('L+ graph was not built from the configured dplus checkpoint')
         return {'kind': 'learned', 'graph_hash': config['graph_hash'], 'spec_version': 'v1.0'}
-    if config.get('spec_version') == 'v1.1':
+    if config.get('spec_version') in {'v1.1', 'v1.2'}:
         if config.get('anchor_mode') != 'same_object' or provenance.get('kind') != 'learned':
-            raise ValueError('v1.1 graph_direct requires a learned graph and same_object anchors')
+            raise ValueError('v1.1+ graph_direct requires a learned graph and same_object anchors')
         model_meta = meta.get('bridge_model_metadata', {})
         if model_meta.get('params_sha256') != config.get('state_checkpoint_sha256'):
-            raise ValueError('v1.1 graph was not built from the configured frozen state checkpoint')
+            raise ValueError('same-object graph was not built from the configured frozen state checkpoint')
         if not str(meta.get('candidate_rule', '')).startswith('cross_episode_observed_object_change_v1_'):
-            raise ValueError('v1.1 graph_direct requires an observed object-change graph')
-        return {'kind': 'learned', 'graph_hash': config['graph_hash'], 'spec_version': 'v1.1'}
+            raise ValueError('graph_direct requires an observed object-change graph')
+        return {'kind': 'learned', 'graph_hash': config['graph_hash'],
+                'spec_version': config.get('spec_version')}
     if provenance.get('kind') != 'oracle_upper_bound' or provenance.get('oracle_np_max') != 1:
         raise ValueError('v0.9 graph_direct requires the O_np1 oracle_upper_bound graph')
     if meta.get('qc_eligible') != 'oracle_upper_bound':
