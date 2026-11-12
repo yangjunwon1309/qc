@@ -398,11 +398,20 @@ class ACFQLAgent(flax.struct.PyTreeNode):
         else:
             network_tx = optax.adam(learning_rate=config['lr'])
         network_params = network_def.init(init_rng, **network_args)['params']
+        if config.get('critic_mode', 'td') == 'graph_direct':
+            # Keep the parameter tree and Adam moments on the same pytree type.
+            # In recent Flax/JAX combinations ModuleDict.init returns a dict,
+            # while graph-direct's immutable parameter replacement below uses
+            # FrozenDict; freezing before optimizer initialization avoids a
+            # dict/FrozenDict mismatch on the first gradient update.
+            network_params = flax.core.unfreeze(network_params)
+            network_params['modules_target_critic'] = network_params['modules_critic']
+            network_params = flax.core.freeze(network_params)
         network = TrainState.create(network_def, network_params, tx=network_tx)
 
-        params = network.params
-
-        params[f'modules_target_critic'] = params[f'modules_critic']
+        if config.get('critic_mode', 'td') != 'graph_direct':
+            params = network.params
+            params[f'modules_target_critic'] = params[f'modules_critic']
 
         config['ob_dims'] = ob_dims
         config['action_dim'] = action_dim
